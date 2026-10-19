@@ -1,0 +1,323 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#030407">
+<title>Pixel Message — Lời chúc dành riêng cho em</title>
+<style>
+:root{color-scheme:dark;--ink:#030407;--mint:#b8c4cc;--line:#333943}
+*{box-sizing:border-box}
+html,body{margin:0;width:100%;height:100%;overflow:hidden;background:var(--ink);font-family:Arial,Helvetica,sans-serif;overscroll-behavior:none}
+#screen{position:fixed;inset:0;width:100%;height:100%;display:block;background:#030407;touch-action:manipulation}
+#edit{position:fixed;right:max(12px,env(safe-area-inset-right));top:max(12px,env(safe-area-inset-top));z-index:3;color:#a5afb7;background:rgba(10,13,18,.48);border:1px solid rgba(160,180,195,.22);border-radius:18px;padding:7px 11px;font-size:11px;letter-spacing:.3px;opacity:.68;backdrop-filter:blur(4px)}
+#hint{position:fixed;bottom:max(18px,env(safe-area-inset-bottom));left:0;right:0;text-align:center;color:#77818c;font-size:9px;letter-spacing:2.1px;opacity:.58;pointer-events:none}
+#panel{display:none;position:fixed;z-index:5;left:5%;right:5%;top:50%;transform:translateY(-50%);max-height:86dvh;overflow:auto;padding:18px;background:rgba(8,11,16,.97);border:1px solid #38414a;border-radius:14px;box-shadow:0 18px 55px #000b;color:#e7edf2}
+#panel h2{font-size:17px;margin:0 0 8px;font-weight:600}
+#panel p{font-size:12px;line-height:1.5;color:#9da8b1;margin:0 0 12px}
+#messages{width:100%;height:230px;resize:vertical;background:#030609;color:#edf2f6;border:1px solid #3d4852;border-radius:8px;padding:11px;font:14px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre-wrap}
+.actions{display:flex;gap:8px;margin-top:12px}
+.actions button{flex:1;border:1px solid #596571;border-radius:8px;padding:11px;background:#151c24;color:#f5f7f9;font-size:13px}
+.actions button.primary{background:#d9e4ec;color:#10151a;border-color:#d9e4ec;font-weight:600}
+#toast{position:fixed;z-index:6;bottom:55px;left:50%;transform:translateX(-50%);padding:9px 13px;border-radius:20px;background:#111820;color:#dce4eb;font-size:12px;opacity:0;transition:opacity .25s;pointer-events:none;white-space:nowrap}
+</style>
+</head>
+<body>
+<canvas id="screen" aria-label="Hiệu ứng pixel tạo lời chúc"></canvas>
+<button id="edit" type="button">Sửa lời chúc</button>
+<div id="hint">CHẠM ĐỂ PHÁT LẠI</div>
+<div id="toast" role="status"></div>
+<div id="panel" role="dialog" aria-modal="true" aria-labelledby="title">
+  <h2 id="title">Chỉnh lời chúc</h2>
+  <p>Mỗi cảnh cách nhau bằng một dòng <b>---</b>. Dùng xuống dòng để chia câu thành nhiều hàng. Giữ nguyên <b>[TRÁI TIM]</b> nếu muốn kết thúc bằng trái tim pixel.</p>
+  <textarea id="messages" spellcheck="false"></textarea>
+  <div class="actions"><button id="cancel" type="button">Đóng</button><button class="primary" id="save" type="button">Lưu & phát lại</button></div>
+</div>
+<script>
+(() => {
+  'use strict';
+  const canvas = document.getElementById('screen');
+  const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
+  const editBtn = document.getElementById('edit');
+  const panel = document.getElementById('panel');
+  const messageBox = document.getElementById('messages');
+  const toast = document.getElementById('toast');
+  const HEART_TOKEN = '[TRÁI TIM]';
+  const DEFAULT_TEXT = [
+    'Hôm nay là\nngày của em',
+    'Chúc em luôn\nđược hạnh phúc',
+    'Luôn có nụ cười\nthường trực\ntrên môi',
+    'Mà người đó\nlà anh được không?',
+    'Làm người yêu\nanh nhé',
+    HEART_TOKEN
+  ];
+  let scenes = DEFAULT_TEXT.map(parseScene);
+  let W = 0, H = 0, dpr = 1, scale = 0.72;
+  let particles = [], streams = [], dust = [];
+  let sceneIndex = -1, sceneStart = 0, lastTime = 0, running = true;
+  let resizeTimer = 0, toastTimer = 0;
+
+  function parseScene(text) {
+    const clean = String(text || '').trim();
+    return clean.toUpperCase() === HEART_TOKEN ? { type: 'heart', text: '' } : { type: 'text', text: clean || ' ' };
+  }
+  function say(message) {
+    toast.textContent = message;
+    toast.style.opacity = '1';
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { toast.style.opacity = '0'; }, 1700);
+  }
+  function random(min, max) { return min + Math.random() * (max - min); }
+
+  function resize() {
+    const oldW = W, oldH = H;
+    W = Math.max(1, window.innerWidth);
+    H = Math.max(1, window.innerHeight);
+    // A capped backing resolution keeps older phones smooth; dots remain crisp.
+    dpr = Math.min(window.devicePixelRatio || 1, 1.15);
+    canvas.width = Math.round(W * dpr);
+    canvas.height = Math.round(H * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    makeBackground();
+    if (sceneIndex >= 0) showScene(sceneIndex, performance.now(), true);
+    else showScene(0, performance.now(), true);
+  }
+
+  function makeBackground() {
+    // Sparse vertical streams, not a full-screen cloud of particles.
+    const count = Math.max(24, Math.min(64, Math.floor(W / 6.6)));
+    streams = Array.from({ length: count }, () => ({
+      x: random(0, W), y: random(-H, H), speed: random(20, 85),
+      size: random(7, 10.5), length: Math.floor(random(5, 15)),
+      phase: random(0, 100), brightness: random(0.10, 0.38),
+      chars: Array.from({length: 16}, () => Math.random() > .5 ? '1' : '0').join(' ')
+    }));
+    dust = Array.from({length: Math.min(105, Math.floor(W * H / 5200))}, () => ({
+      x: random(0,W), y: random(0,H), r: random(.35,.9), a: random(.04,.20),
+      tw: random(0.4,1.3), ph: random(0,6.28)
+    }));
+  }
+
+  function spacePunctuation(line) {
+    // A thin visual gap before punctuation prevents the pixel dots from making it look glued to the last letter.
+    return line.replace(/\s*([,.;:!?])/g, '\u2009$1');
+  }
+
+  function fitFont(lines, maskCtx) {
+    // Larger headline lettering; long lines automatically shrink just enough to fit.
+    let fs = Math.min(64, W * 0.145, H * 0.10);
+    fs = Math.max(26, fs);
+    try { maskCtx.letterSpacing = '0.7px'; } catch (_) {}
+    while (fs > 22) {
+      maskCtx.font = `700 ${fs}px Arial, Helvetica, sans-serif`;
+      let maxWidth = 0;
+      for (const line of lines) maxWidth = Math.max(maxWidth, maskCtx.measureText(line).width);
+      if (maxWidth <= W * .91) break;
+      fs -= 1;
+    }
+    return fs;
+  }
+
+  function makeTextTargets(text) {
+    const lines = text.split('\n').map(s => s.trim()).filter(Boolean).slice(0, 5).map(spacePunctuation);
+    const off = document.createElement('canvas');
+    const mw = Math.max(1, Math.floor(W * scale));
+    const mh = Math.max(1, Math.floor(H * scale));
+    off.width = mw; off.height = mh;
+    const m = off.getContext('2d', { willReadFrequently: true });
+    m.setTransform(scale, 0, 0, scale, 0, 0);
+    const fs = fitFont(lines.length ? lines : [' '], m);
+    const lineH = fs * 1.28;
+    const startY = H * .49 - (lines.length - 1) * lineH * .5;
+    m.font = `700 ${fs}px Arial, Helvetica, sans-serif`;
+    try { m.letterSpacing = '0.7px'; } catch (_) {}
+    m.textAlign = 'center'; m.textBaseline = 'middle';
+    m.fillStyle = '#fff';
+    lines.forEach((line, i) => m.fillText(line, W * .5, startY + i * lineH, W * .93));
+    const data = m.getImageData(0, 0, mw, mh).data;
+    const pts = [];
+    // Dense sampling makes the letters read as solid, sharp pixel lettering rather than scattered dots.
+    const step = 1;
+    for (let y = 0; y < mh; y += step) {
+      for (let x = 0; x < mw; x += step) {
+        if (data[(y * mw + x) * 4 + 3] > 105) {
+          pts.push({ x: x / scale, y: y / scale });
+        }
+      }
+    }
+    return pts;
+  }
+
+  function makeHeartTargets() {
+    const off = document.createElement('canvas');
+    const mw = Math.max(1, Math.floor(W * scale)), mh = Math.max(1, Math.floor(H * scale));
+    off.width = mw; off.height = mh;
+    const m = off.getContext('2d', { willReadFrequently: true });
+    m.setTransform(scale,0,0,scale,0,0);
+    const cx = W * .5, cy = H * .49;
+    const hw = Math.min(W * .24, 112), hh = Math.min(H * .095, 78);
+    m.beginPath();
+    m.moveTo(cx, cy + hh * .73);
+    m.bezierCurveTo(cx - hw * 1.18, cy + hh * .03, cx - hw * 1.04, cy - hh * .91, cx - hw * .45, cy - hh * .92);
+    m.bezierCurveTo(cx - hw * .13, cy - hh * .92, cx, cy - hh * .66, cx, cy - hh * .47);
+    m.bezierCurveTo(cx, cy - hh * .66, cx + hw * .13, cy - hh * .92, cx + hw * .45, cy - hh * .92);
+    m.bezierCurveTo(cx + hw * 1.04, cy - hh * .91, cx + hw * 1.18, cy + hh * .03, cx, cy + hh * .73);
+    m.closePath();
+    m.strokeStyle = '#fff'; m.lineWidth = 3.1; m.stroke();
+    const data = m.getImageData(0,0,mw,mh).data, pts=[];
+    for(let y=0;y<mh;y+=1) for(let x=0;x<mw;x+=1) {
+      if(data[(y*mw+x)*4+3] > 60 && Math.random() > .12) pts.push({x:x/scale+random(-.7,.7),y:y/scale+random(-.7,.7)});
+    }
+    return pts;
+  }
+
+  function showScene(index, now = performance.now(), immediate = false) {
+    sceneIndex = (index + scenes.length) % scenes.length;
+    sceneStart = now;
+    const scene = scenes[sceneIndex];
+    const pts = scene.type === 'heart' ? makeHeartTargets() : makeTextTargets(scene.text);
+    const old = particles;
+    const next = [];
+    for (let i = 0; i < pts.length; i++) {
+      const p = old.pop() || {
+        x: random(0,W), y: random(0,H), vx: 0, vy: 0, alpha: random(.58,1), size: random(1.45,1.9)
+      };
+      p.tx = pts[i].x; p.ty = pts[i].y;
+      p.scatterX = random(0,W); p.scatterY = random(0,H);
+      p.startX = p.x; p.startY = p.y;
+      p.fadeOut = false; p.heart = scene.type === 'heart';
+      p.alpha = random(.72,1); p.size = p.heart ? random(1.45,2.0) : random(1.55,1.95);
+      p.tone = Math.random();
+      next.push(p);
+    }
+    // Particles left from the previous phrase dissolve instead of forming a bright clump.
+    for (const p of old) {
+      p.scatterX = random(0,W); p.scatterY = random(0,H);
+      p.startX = p.x; p.startY = p.y; p.fadeOut = true; p.fadeStart = now;
+      next.push(p);
+    }
+    particles = next;
+    if (immediate) {
+      for (const p of particles) {
+        if (!p.fadeOut) { p.x = p.scatterX; p.y = p.scatterY; }
+      }
+    }
+  }
+
+  function drawBackground(now, dt) {
+    ctx.fillStyle = '#030407';
+    ctx.fillRect(0, 0, W, H);
+    // A few dim, independent matrix streams in the background.
+    ctx.textAlign = 'center';
+    for (const s of streams) {
+      s.y += s.speed * dt;
+      if (s.y - s.length * s.size > H + 10) { s.y = random(-H * .55, -10); s.x = random(0,W); }
+      ctx.font = `${s.size}px monospace`;
+      for (let j = 0; j < s.length; j++) {
+        const yy = s.y - j * s.size * 1.12;
+        if (yy < -12 || yy > H + 12) continue;
+        const head = j === 0;
+        const alpha = s.brightness * (1 - j / (s.length * 1.25));
+        ctx.fillStyle = head ? `rgba(202,213,222,${Math.min(.65,alpha*1.65)})` : `rgba(135,151,166,${Math.max(.025,alpha)})`;
+        ctx.fillText(s.chars[(j + Math.floor(s.phase)) % s.chars.length], s.x, yy);
+      }
+    }
+    for (const d of dust) {
+      const flicker = .62 + .38 * Math.sin(now * .001 * d.tw + d.ph);
+      ctx.fillStyle = `rgba(176,190,204,${d.a*flicker})`;
+      ctx.fillRect(d.x,d.y,d.r,d.r);
+    }
+  }
+
+  function frame(now) {
+    if (!running) return;
+    const dt = lastTime ? Math.min(.04, (now - lastTime) / 1000) : 1/60;
+    lastTime = now;
+    drawBackground(now,dt);
+    if (sceneIndex >= 0 && now - sceneStart > (scenes[sceneIndex].type === 'heart' ? 4300 : 3350)) {
+      showScene(sceneIndex + 1, now);
+    }
+    const age = now - sceneStart;
+    const ease = 1 - Math.pow(.90, dt * 60);
+    // Batch pixel squares into a few paths to keep the denser lettering smooth on phones.
+    const textBuckets = [[], [], [], []];
+    const heartBuckets = [[[], [], [], []], [[], [], [], []]];
+    const alphaLevels = [.42, .60, .78, .96];
+    const pulse = .82 + .18 * Math.sin(now * .004);
+    for (const p of particles) {
+      let tx = p.tx, ty = p.ty;
+      if (age < 360) { tx = p.scatterX; ty = p.scatterY; }
+      const movement = age < 360 ? Math.max(.045, ease) : Math.max(.025, ease * .92);
+      p.x += (tx - p.x) * movement;
+      p.y += (ty - p.y) * movement;
+      let alpha = p.alpha;
+      if (p.fadeOut) alpha *= Math.max(0, 1 - (now - p.fadeStart) / 640);
+      if (alpha < .08) continue;
+      const bucket = Math.min(3, Math.floor(alpha * 4));
+      if (p.heart) {
+        const tone = p.tone > .72 ? 1 : 0;
+        heartBuckets[tone][bucket].push(p);
+      } else {
+        textBuckets[bucket].push(p);
+      }
+    }
+    for (let b = 0; b < 4; b++) {
+      if (textBuckets[b].length) {
+        ctx.beginPath();
+        for (const p of textBuckets[b]) ctx.rect(p.x, p.y, p.size, p.size);
+        ctx.fillStyle = `rgba(241,246,252,${alphaLevels[b]})`;
+        ctx.fill();
+      }
+    }
+    for (let tone = 0; tone < 2; tone++) {
+      for (let b = 0; b < 4; b++) {
+        const bucket = heartBuckets[tone][b];
+        if (!bucket.length) continue;
+        ctx.beginPath();
+        for (const p of bucket) {
+          const sz = p.size * pulse;
+          ctx.rect(p.x, p.y, sz, sz);
+        }
+        ctx.fillStyle = tone ? `rgba(255,232,255,${alphaLevels[b] * pulse})` : `rgba(229,174,255,${alphaLevels[b] * pulse})`;
+        ctx.fill();
+      }
+    }
+    // Drop dissolved particles after the transition, to keep the live count low.
+    if (particles.length > 0 && (Math.floor(now / 250) !== Math.floor((now-dt*1000) / 250))) {
+      particles = particles.filter(p => !p.fadeOut || now - p.fadeStart < 640);
+    }
+    requestAnimationFrame(frame);
+  }
+
+  editBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    messageBox.value = scenes.map(s => s.type === 'heart' ? HEART_TOKEN : s.text).join('\n---\n');
+    panel.style.display = 'block';
+  });
+  document.getElementById('cancel').addEventListener('click', () => { panel.style.display = 'none'; });
+  document.getElementById('save').addEventListener('click', () => {
+    const parsed = messageBox.value.split(/\n\s*---\s*\n/g).map(parseScene).filter(s => s.type === 'heart' || s.text.trim());
+    if (!parsed.length) { say('Anh nhập ít nhất một lời chúc nhé.'); return; }
+    scenes = parsed;
+    panel.style.display = 'none';
+    showScene(0, performance.now());
+    say('Đã lưu lời chúc mới.');
+  });
+  canvas.addEventListener('pointerdown', (e) => {
+    if (panel.style.display === 'block') return;
+    // Tap anywhere on the animation to replay from the first phrase.
+    showScene(0, performance.now());
+  }, {passive:true});
+  window.addEventListener('resize', () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(resize, 100);
+  }, {passive:true});
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) lastTime = 0; });
+
+  resize();
+  messageBox.value = DEFAULT_TEXT.join('\n---\n');
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
